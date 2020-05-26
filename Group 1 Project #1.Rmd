@@ -1,0 +1,509 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+# BOOK RECOMMENDER SYSTEM
+### By Alpit Shah, Franklin Lin, Tatiana Samsonova, MD Adewale, Zahid Kaiser
+
+<br>
+
+**Abstract**
+
+The goal of this project is to build a book recommending application. The success of the project will be determined by the accuracy with which the system recommends appropriate books to readers (RMSE and TPR). The model can be reused by libraries, booksellers, social networks, book clubs, etc.
+
+## Introduction and Discussion
+A taste in books is a very subjective matter; therefore, the model should not recommend the books with highest absolute popularity, but the books that are most likely to appeal to a particular reader.  
+The dataset used in this book recommendation model includes just over a million ratings recorded over several years by the Bookcrossing community. User-based collaborative filtering method on a rating matrix is applied to study the relationship between users and ratings, as well as between books  and ratings, and the results are used to predict what books a new reader (book club member, etc.) will like. RMSE is used to measure the accuracy of the  recommendation model.
+
+
+### Dataset {.tabset}
+
+The study explored data consisting of two recordsets: `BX-Books` and `BX-Book-Ratings`. The data were obtained from IIF website,  http://www2.informatik.uni-freiburg.de/~cziegler/BX/, and originate from the Bookcrossing community whose members read, exchange, and rate books. "Collected by Cai-Nicolas Ziegler in a 4-week crawl (August / September 2004) from the Bookcrossing community with kind permission from Ron Hornbaker, CTO of Humankind Systems. Contains 278,858 users (anonymized but with demographic information) providing 1,149,780 ratings (explicit / implicit) about 271,379 books."
+
+As the name suggests, `BX-Book-Ratings` dataset contains users' ratings of the books, while `BX-Books` contains information on the books such as author, year of publication, etc. The tables are joined by ISBN which is an unique code and an industry standard way of identifying a book.  It is, however, a string of characters which might be suboptimal. If ever the problem of speeding up performance comes up for this application, it is strongly suggested to add a numeric book ID and use it for all table operations.
+
+The recommender model will be trained using the ratings dataset. This dataset does not require much feature engineering beyond filtering out as much sparse data as is reasonable. The final dataset will be a normalized real rating matrix based on a selection of books and users who have a sufficient number of ratings.
++ BX-Books: books and their data such as author, year, etc.
++ BX-Book-Ratings: users' ratings of the books, contains user ID, book ID, rating and ISBN of the book
+
+There are no outliers but there are some nulls: the ratings are ranged between 1 and 10 as expected, but some are zeroes. In this study we assume a 0 value means that the rating was not given. 
+
+
+
+### Ethical ML Framework
+
+As the goal of this application is only to recommend books, many aspects of the ethical ML framework
+do not directly apply. The data are published and available online, and we can assume they were collected in transparent ways. The data are depersonalized.
+That being said, there is likely a large segment of the populace underrepresented in this rating dataset. However, more investigation is required to determine which groups of the population are underrepresented among Bookcrossing users, considering that it is completely free to join and use. This will potentially reduce the recommender’s accuracy for the overlooked group or groups of the population. Should the outcome of the model application ever be of more social impact, this will have to be corrected with appropriate data collection methods.
+
+
+### Assumptions
+
+The following assumptions were used in the development of the model:
+1. A rating of 0 means that the rating was not given and is therefore treated like a NA.
+2. Even though the group of Bookcrossing users may not be the same as general population, their tastes and preferences are diverse enough to train the model. At the very least the model will be useful for Bookcrossers themselves.
+
+## Data preparation
+
+Load the two datasets.
+
+```{r message=FALSE, echo=FALSE, warning=FALSE, results='hide'}
+## Read in the data
+## We start by loading some libraries and reading in the two data files.
+library(recommenderlab)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(DT)
+library(knitr)
+library(grid)
+library(gridExtra)
+library(corrplot)
+library(qgraph)
+library(methods)
+library(Matrix)
+library(psych)
+#library (magrittr)
+library(plyr)
+
+```
+
+
+```{r message=FALSE, warning=FALSE, error=FALSE }
+
+books <- fread(file.choose(),header=TRUE, strip.white = T)
+
+ratings <-fread(file.choose(),header=TRUE, strip.white = T) 
+```
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+
+#### Ratings.csv
+```{r, result='asis', echo=FALSE}
+datatable(head(ratings, 10), class = "nowrap hover row-border", options = list(dom = 't',scrollX = FALSE, autoWidth = TRUE))
+```
+
+<br>
+```{r, echo=FALSE}
+glimpse(ratings)
+```
+
+#### Books.csv
+```{r, result='asis', echo=FALSE}
+datatable(head(books,5),  class = "nowrap hover row-border", options = list(dom = 't',scrollX = TRUE, autoWidth=TRUE, columnDefs = list(list(width = '200px', targets = c(7)),list(width = '300px', targets = c(7,8)))))
+```
+<br>
+```{r, echo=FALSE}
+glimpse(books)
+```
+
+
+### Cleaning the dataset
+
+Remove NA values if any
+```{r}
+books<- na.omit(books) # Remove rows with N/A
+ratings<- na.omit(ratings) # Remove rows with N/A
+cat('\nNumber of rows\n')
+cat('\nRatings dataset:', nrow(ratings))
+cat('\nBooks dataset:', nrow(books))
+```
+
+When exploring the data it was discovered that many ratings have a value of 0. We assume that these are equivalent to rating not given, and such rows have to be removed.
+```{r}
+cat('Number of zero value ratings: ', nrow(ratings[Rating == 0]))
+ratings <- ratings[Rating >0]
+cat('\nNew number of rows:', nrow(ratings))
+```
+Then users who rated fewer than 3 books were removed. 
+```{r echo=FALSE}
+r1=dplyr::tbl_df(ratings)
+df = dplyr::count(r1, UserID) #group users and determine who gave less than three ratings
+
+df1 <- filter(df, df$n>2) #filter to get a list of users who gave three or more ratings
+ratings = subset (ratings, UserID %in% df1$UserID) #filter ratings table by the obtained list of users
+cat('New number of rows:', nrow(ratings))
+head(ratings)
+```
+
+
+
+## Exploring the data
+
+#### What is the distribution of ratings?
+It was found that people tend to give quite positive ratings to books. Most of the ratings are in the 7-9 range, while relatively few ratings are in the 1-5 range. 
+
+```{r message=FALSE, warning=FALSE}
+ratings %>% 
+  ggplot(aes(x = Rating, fill = factor(Rating))) +
+  geom_bar(fill = "cadetblue3", color = "grey20") 
+```
+
+#### Number of ratings per user
+
+All users have at least 3 ratings after filtering. It can be seen that there are some users with many ratings ("the long tail" of the distribution). Otherwise the plot is pretty as expected.
+
+```{r}
+ratings %>% 
+  dplyr::group_by(UserID) %>% 
+  dplyr::summarize(number_of_ratings_per_user = n()) %>% 
+  ggplot(aes(number_of_ratings_per_user)) + 
+  geom_bar(fill = "cadetblue3", color = "grey20") + coord_cartesian(c(3, 50))
+```
+
+#### Distribution of mean user ratings
+
+The distribution of ratings given by users looks pretty nondescript - there are more values towards the middle and less on both ends, as could well be expected. We can see, however, that there is a definite skew to the right, so the most frequently given ratings are around the 7-9 range. This may have several explanations:
++ Readers are unwilling to give a 10 as this has to be a really perfect book to earn this mark
++ Readers only finish (and therefore rate) books that they liked
++ Readers use some other recommendation engine(s) or direct recommendations from friends to only read the books they know for sure they will like.
+
+
+```{r message=FALSE, warning=FALSE}
+ratings %>% 
+  dplyr::group_by(UserID) %>% 
+  dplyr::summarize(mean_user_rating = mean(Rating)) %>% 
+  ggplot(aes(mean_user_rating)) +
+  geom_histogram(fill = "cadetblue3", color = "grey20")
+```
+
+#### Number of ratings per book
+
+A small number of books have several thousand ratings each. Apparently those are bestsellers. 
+
+```{r}
+ratings %>% 
+  dplyr::group_by(ISBN) %>% 
+  dplyr::summarize(number_of_ratings_per_book = n()) %>% 
+  ggplot(aes(number_of_ratings_per_book)) + 
+  geom_bar(fill = "cadetblue3", color = "grey20", width = 1) + coord_cartesian(c(0,40))
+```
+
+#### Distribution of book ratings 
+
+The plot of mean ratings by book don't reveal any peculiarities. We see the right skew again: the majority of ratings were in the higher range. Most books circulating in the Bookcrossing community obviously are well-liked books, otherwise people would not be reading and exchanging them.
+
+```{r message=FALSE, warning=FALSE}
+ratings %>% 
+  dplyr::group_by(ISBN) %>% 
+  dplyr::summarize(mean_book_rating = mean(Rating)) %>% 
+  ggplot(aes(mean_book_rating)) + geom_histogram(fill = "cadetblue3", color = "grey20") 
+```
+
+
+
+#### Stratification by publisher
+
+Is it possible that books from some publishers get higher ratings than books from other publishers?  This chart shows mean book rating by publisher.
+
+```{r echo=FALSE}
+df1= plyr::join(books, ratings, by="ISBN")#join tables
+df1 <- na.omit(df1)
+head(df)
+
+r1=dplyr::tbl_df(df1)
+df2 = dplyr::count(r1, Publisher) 
+head(df2)
+df3 <- filter(df2, df2$n>20) #filter to get a list of publishers with 20+ books
+head(df3)
+glimpse(df3)
+df4 = subset (df1, Publisher %in% df3$Publisher) #filter  table by the obtained list of Publishers
+cat('\nNew number of rows:', nrow(df4))
+df4 <- na.omit(df4)
+cdata <- ddply(df4, c("Publisher"), summarise,
+               mean = mean(Rating)
+)
+ggplot(cdata, aes(x=reorder (Publisher, mean), y=mean)) + geom_col(fill = "cadetblue3")
+
+```
+
+
+It can be seen that mean ratings by publisher vary significantly.
+
+Is it possible that publishers who publish more books in a year get higher ratings?  The next chart shows a relationship between the mean ratings of all books by a specific publisher (y) and the total number of books in the dataset that were published by this publisher (x).
+
+```{r}
+df11= plyr::join(cdata, df3, by="Publisher")#join tables
+head(df11)
+
+df11 <- na.omit(df11)
+
+ggplot(df11, aes(x=reorder(n, mean), y=mean)) + geom_point()
+
+```
+There is an obvious correlation but with some outliers. It appears that the fewer books a publisher publishes, the lower is the average rating of its books. It would be interesting to look at this in more detail in the future. 
+
+
+#### Top 10 rated books
+
+It appears reasonable to remove from consideration books with less than 10 ratings. After that, the list of top rated books looked as follows:
+
+```{r}
+
+df23 = dplyr::count(ratings, ISBN) 
+head(df23)
+df24 <- filter(df23, df23$n>=10) #filter to get a list of books with less than 10 ratings
+df25 = subset (books, ISBN %in% df24$ISBN) #filter  table by the obtained list of books
+df_meanbookratings <- ratings %>% 
+  dplyr::group_by(ISBN) %>% 
+  dplyr::summarize(mean_book_rating = mean(Rating)) %>% 
+   mutate_if(is.numeric, ~round(., 2))
+
+df31= plyr::join(df_meanbookratings, df25, by="ISBN") #join tables
+
+df31 <- na.omit(df31)
+
+df31 %>% 
+  mutate(image = paste0('<img src="', df31$`Image-URL-S`, '"></img>')) %>% 
+  arrange(-mean_book_rating) %>% 
+  top_n(10,wt = mean_book_rating) %>% 
+  select(image, `Book-Author`, `Book-Title`, mean_book_rating ) %>% 
+  datatable(class = "nowrap hover row-border", escape = FALSE, options = list(dom = 't',scrollX = TRUE, autoWidth =  TRUE))
+```
+
+<br><br>
+
+## Recommender
+
+Books are recommended book based on the ratings from common reviewers using Collaborative Filtering (UBCF). A function was created that returns a vector of ratings of a book from a vector of common users. Another function  returns a dataframe of ratings from the same reviewers given two ISBNs. After that we calculate the similarity in ratings between two ISBNs. This allows the model to recommened books based on what the user has read and find books highly rated by other users who have read that book and display suggestions based on similarity scores between the users. Simply put we are stating that similarity score represents the similarity to a book a user selects and is between -1.0 and 1.0. A high similarity score means that if the user enjoyed the book, they will also enjoy this one too. A negative sim means the user should probably avoid it. This is what the output will be on the Shiny app.
+
+
+```{r}
+
+library(recommenderlab)
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(DT)
+library(knitr)
+library(grid)
+library(gridExtra)
+library(corrplot)
+library(qgraph)
+library(methods)
+library(Matrix)
+library(psych)
+#library (magrittr)
+library(plyr)
+
+data <- readRDS(file.choose())
+books <- readRDS(file.choose())
+results <- readRDS(file.choose())
+booklist <- readRDS(file.choose())
+
+# Create a function that capitalizes the first word of each word in a sentence
+simpleCap <- function(x) {
+    s <- strsplit(x, " ")[[1]]
+    paste(toupper(substring(s,1,1)), substring(s,2),
+          sep = "", collapse=" ")
+}
+
+# Create a function that returns the Book Title given an ISBN
+
+book_isbn_to_title <- function(isbn) {
+    if(class(isbn) == "numeric") {
+        stop("ISBN must be in quotations")
+    }
+    books[books$ISBN == isbn,]$Book.Title
+}
+
+book_title_to_isbn <- function(title) {
+    title <- simpleCap(tolower(title)) #Capitalize first letter of each word
+    # If book not found:
+    len <- length(books[suppressWarnings(grep(title, books$Book.Title)),]$ISBN)
+    if(len == 0){
+        stop("Book title not found")
+    } else if(len > 1){
+        #cat("More than one title found. <Need to fix>")
+        books[suppressWarnings(grep(title, books$Book.Title)),][1,]$ISBN #takes the first result
+    }
+    books[suppressWarnings(grep(title, books$Book.Title)),]$ISBN
+}
+
+
+# Create a function that returns a vector of ratings of a book from a vector of common users
+get_reviews <- function(isbn, common_users) {
+    data.subset_isbn <- subset(data, ISBN == isbn)
+    as.numeric(data.subset_isbn[data.subset_isbn$User.ID %in% common_users,]$Book.Rating)
+}
+
+
+# Create a function that returns a dataframe of ratings from the same reviewers given two ISBNs
+
+common_reviewer_by_isbn <- function(isbn1, isbn2) {
+    reviews1 <- subset(data, ISBN == isbn1)
+    reviews2 <- subset(data, ISBN == isbn2)
+    
+    reviewers_sameset <- intersect(reviews1[,'User.ID'],
+                                   reviews2[,'User.ID'])
+    if(length(reviewers_sameset) == 0){
+        NA
+    } else {
+        reviewers_sameset
+    }
+}
+
+
+
+# Create a function that calculates the similarity in ratings between two ISBNs
+
+calc_similarity <- function (isbn1, isbn2) {
+    common_users <- common_reviewer_by_isbn(isbn1, isbn2)
+        if(suppressWarnings(is.na(common_users))){
+            return (NA)
+        }
+    isbn1.reviews <- get_reviews(isbn1, common_users)
+    isbn2.reviews <- get_reviews(isbn2, common_users)
+    cor(isbn1.reviews, isbn2.reviews)
+}
+
+
+find_similar_books <- function(mybook, style = NULL, n = 5){
+    if(suppressWarnings(is.na(as.numeric(mybook)) == TRUE)){  #If mybook is a book title:
+        myisbn <- book_title_to_isbn(title = mybook)
+    }
+    
+    similar <- subset(results, isbn1 == myisbn)
+    similar <- merge(books, similar, by.x = "ISBN", by.y = "isbn2")
+    similar <- similar[order(-similar$sim),]
+    n <- min(n, nrow(similar))
+    similar <- similar[1:n, c(1:5, 7)]
+    similar
+}
+
+
+```
+
+
+```{r}
+
+# Comparison of the models
+
+# Read in files
+
+books <- fread(file.choose())
+ratings <- fread(file.choose())
+book_tags <- fread(file.choose())
+tags <- fread(file.choose())
+
+```
+
+```{r}
+dimension_names <- list(user_id = sort(unique(ratings$user_id)), book_id = sort(unique(ratings$book_id)))
+ratingmat <- spread(select(ratings, book_id, user_id, rating), book_id, rating) %>% select(-user_id)
+
+ratingmat <- as.matrix(ratingmat)
+dimnames(ratingmat) <- dimension_names
+ratingmat[1:5, 1:5]
+```
+
+```{r}
+ratingmat0 <- ratingmat
+ratingmat0[is.na(ratingmat0)] <- 0
+sparse_ratings <- as(ratingmat0, "sparseMatrix")
+rm(ratingmat0)
+gc()
+```
+
+```{r}
+
+#Convert class to sparse matrices.
+real_ratings <- new("realRatingMatrix", data = sparse_ratings)
+real_ratings
+```
+
+```{r}
+# UBCF algorithm 
+
+model <- Recommender(real_ratings, method = "UBCF", param = list(method = "pearson", nn = 4))
+scheme <- evaluationScheme(real_ratings[1:500,], method = "cross-validation", k = 10, given = -1, goodRating = 5)
+```
+
+##Evaluating predictions
+
+In this step, we list the algorithms we want to compare.  We vary this parameter from 5 to 50 and plot the RMSE. As a baseline one also added an algorithm ("RANDOM") that randomly predicts a rating for each user.  
+
+```{r}
+
+algorithms <- list("random" = list(name = "RANDOM", param = NULL),
+                   "UBCF_05" = list(name = "UBCF", param = list(nn = 5)),
+                   "UBCF_10" = list(name = "UBCF", param = list(nn = 10)),
+                   "UBCF_30" = list(name = "UBCF", param = list(nn = 30)),                   
+                   "UBCF_50" = list(name = "UBCF", param = list(nn = 50))
+                   )
+# evaluate the alogrithms with the given scheme            
+results <- evaluate(scheme, algorithms, type = "ratings")
+
+# restructure results output
+tmp <- lapply(results, function(x) slot(x, "results"))
+res <- tmp %>% 
+  lapply(function(x) unlist(lapply(x, function(x) unlist(x@cm[ ,"RMSE"])))) %>% 
+  as.data.frame() %>% 
+  gather(key = "Algorithm", value = "RMSE")
+
+res %>% 
+  ggplot(aes(Algorithm, RMSE, fill = Algorithm)) +
+  geom_bar(stat = "summary") + geom_errorbar(stat = "summary", width = 0.3, size = 0.8) +
+  coord_cartesian(ylim = c(0.6, 1.3)) + guides(fill = FALSE)
+```
+
+We also want to compare UBCF with two additional algorithms, "popular" predicts ratings accoring to their mean_rating, SVD is matrix factorization approach. 
+
+```{r algorithm-comparison, fig.width=5}
+
+
+scheme <- evaluationScheme(real_ratings[1:500,], method = "cross-validation", k = 10, given = -1, goodRating = 5)
+
+algorithms <- list("random" = list(name = "RANDOM", param = NULL),
+                   "popular" = list(name = "POPULAR"),
+                   "UBCF" = list(name = "UBCF"),
+                   "SVD" = list(name = "SVD")
+                   )
+                   
+results <- evaluate(scheme, algorithms, type = "ratings", progress = FALSE)
+
+# restructure results output
+tmp <- lapply(results, function(x) slot(x, "results"))
+res <- tmp %>% 
+  lapply(function(x) unlist(lapply(x, function(x) unlist(x@cm[ ,"RMSE"])))) %>% 
+  as.data.frame() %>% 
+  gather(key = "Algorithm", value = "RMSE")
+
+res %>% 
+  mutate(Algorithm=factor(Algorithm, levels = c("random", "popular", "UBCF", "SVD"))) %>%
+  ggplot(aes(Algorithm, RMSE, fill = Algorithm)) + geom_bar(stat = "summary") + 
+  geom_errorbar(stat = "summary", width = 0.3, size = 0.8) + coord_cartesian(ylim = c(0.6, 1.3)) + 
+  guides(fill = FALSE)
+```
+
+## Shiny App link
+
+https://ushahal.shinyapps.io/book-recommender-ShinyApp-master/
+<br>
+
+## Github code and data link
+
+https://github.com/franklinprc/project1--Recommender-System
+<br>
+
+## Used sources
+<br>
+
+####Data
+
+http://www2.informatik.uni-freiburg.de/~cziegler/BX/
+
+#### Code
+
+https://www.kaggle.com/philippsp/book-recommender-collaborative-filtering-shiny/code
+https://github.com/polong-lin/book-recommender-ShinyApp
+
+
